@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bloom_filter.h"
 #include "memtable.h"
 #include "status.h"
 
@@ -47,6 +48,7 @@ private:
     std::string block_;
     std::string lastKey_;
     std::vector<BlockIndex> index_;
+    BloomFilter bloom_;
 };
 
 class SSTableReader {
@@ -86,6 +88,7 @@ private:
     Status ReadBlock(std::size_t blockNumber, std::string& block) const;
     int fd_ = -1;
     std::vector<BlockIndex> index_;
+    std::string bloomFilter_;
 };
 
 }

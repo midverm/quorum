@@ -13,8 +13,10 @@ namespace quorum {
 using namespace std;
 namespace {
 
-constexpr uint64_t kMagicNumber = 0x514f52554d535354ULL;
-constexpr uint64_t kFooterSize = 24;
+constexpr uint64_t kLegacyMagicNumber = 0x514f52554d535354ULL;
+constexpr uint64_t kMagicNumber = 0x514f52554d535332ULL;
+constexpr uint64_t kLegacyFooterSize = 24;
+constexpr uint64_t kFooterSize = 40;
 
 bool TakeEntry(string_view& bytes, string_view& key, string_view& value) {
     uint32_t length;
@@ -62,6 +64,7 @@ Status SSTableBuilder::Add(string_view internalKey, string_view value) {
     PutString(block_, value);
     lastKey_.assign(internalKey);
     if (block_.size() >= 4096) status_ = FlushBlock();
+    if (status_.ok()) bloom_.Add(UserKey(internalKey));
     return status_;
 }
 
@@ -84,6 +87,12 @@ Status SSTableBuilder::Finish(FileMetadata& metadata) {
         return Status::InvalidArgument("cannot finish empty or finished SSTable");
     status_ = FlushBlock();
     if (!status_.ok()) return status_;
+    const string filterBytes = bloom_.Finish();
+    const uint64_t filterOffset = offset_;
+    const uint64_t filterSize = filterBytes.size() + 8;
+    status_ = AppendRecord(fd_, filterBytes);
+    if (!status_.ok()) return status_;
+    offset_ += filterSize;
     string indexBytes;
     Put32(indexBytes, static_cast<uint32_t>(index_.size()));
     for (const auto& block : index_) {
@@ -95,6 +104,8 @@ Status SSTableBuilder::Finish(FileMetadata& metadata) {
     }
     status_ = AppendRecord(fd_, indexBytes);
     string footer;
+    Put64(footer, filterOffset);
+    Put64(footer, filterSize);
     Put64(footer, offset_);
     Put64(footer, indexBytes.size() + 8);
     Put64(footer, kMagicNumber);
@@ -123,18 +134,32 @@ Status SSTableReader::Open(const string& path) {
     struct stat info{};
     Status status;
     if (::fstat(fd, &info) != 0) status = FileError("stat SSTable");
-    if (status.ok() && info.st_size < static_cast<off_t>(kFooterSize))
+    if (status.ok() && info.st_size < static_cast<off_t>(kLegacyFooterSize))
         status = Status::Corruption("short SSTable footer");
     string footer;
-    if (status.ok()) status = ReadAt(fd, info.st_size - kFooterSize, kFooterSize, footer);
+    if (status.ok()) status = ReadAt(fd, info.st_size - kLegacyFooterSize, kLegacyFooterSize, footer);
     uint64_t indexOffset = 0, indexSize = 0, magic = 0;
+    uint64_t filterOffset = 0, filterSize = 0, footerSize = kLegacyFooterSize;
     if (status.ok()) {
         string_view view(footer);
-        Take64(view, indexOffset);
-        Take64(view, indexSize);
-        Take64(view, magic);
-        const uint64_t dataEnd = static_cast<uint64_t>(info.st_size) - kFooterSize;
-        if (magic != kMagicNumber || indexSize < 8 || indexSize > kMaxRecordSize + 8ULL ||
+        if (!Take64(view, indexOffset) || !Take64(view, indexSize) || !Take64(view, magic) ||
+            (magic != kMagicNumber && magic != kLegacyMagicNumber))
+            status = Status::Corruption("invalid SSTable footer");
+    }
+    if (status.ok() && magic == kMagicNumber) {
+        footerSize = kFooterSize;
+        if (info.st_size < static_cast<off_t>(footerSize))
+            status = Status::Corruption("short SSTable footer");
+        if (status.ok()) status = ReadAt(fd, info.st_size - footerSize, 16, footer);
+        if (status.ok()) {
+            string_view view(footer);
+            if (!Take64(view, filterOffset) || !Take64(view, filterSize))
+                status = Status::Corruption("invalid SSTable filter footer");
+        }
+    }
+    if (status.ok()) {
+        const uint64_t dataEnd = static_cast<uint64_t>(info.st_size) - footerSize;
+        if (indexSize < 8 || indexSize > kMaxRecordSize + 8ULL ||
             indexOffset > dataEnd || indexSize != dataEnd - indexOffset)
             status = Status::Corruption("invalid SSTable footer");
     }
@@ -147,6 +172,7 @@ Status SSTableReader::Open(const string& path) {
             status = Status::Corruption("invalid SSTable index record");
     }
     vector<BlockIndex> blocks;
+    uint64_t dataEnd = 0;
     if (status.ok()) {
         string_view view(indexBytes);
         uint32_t count = 0;
@@ -167,8 +193,19 @@ Status SSTableReader::Open(const string& path) {
             nextOffset += block.size;
             blocks.push_back(std::move(block));
         }
-        if (status.ok() && (!view.empty() || nextOffset != indexOffset))
+        if (status.ok() && (!view.empty() ||
+            (magic == kLegacyMagicNumber && nextOffset != indexOffset)))
             status = Status::Corruption("invalid SSTable index bounds");
+        dataEnd = nextOffset;
+    }
+    string filter;
+    if (status.ok() && magic == kMagicNumber && filterOffset == dataEnd &&
+        filterOffset <= indexOffset && filterSize >= 8 && filterSize <= kMaxRecordSize + 8ULL &&
+        filterSize == indexOffset - filterOffset) {
+        uint64_t offset = filterOffset;
+        bool complete;
+        Status filterStatus = ReadRecord(fd, indexOffset, offset, filter, complete);
+        if (!filterStatus.ok() || !complete || offset != indexOffset) filter.clear();
     }
     if (!status.ok()) {
         ::close(fd);
@@ -176,6 +213,7 @@ Status SSTableReader::Open(const string& path) {
         return status;
     }
     index_ = std::move(blocks);
+    bloomFilter_ = std::move(filter);
     return {};
 }
 
@@ -203,6 +241,7 @@ Status SSTableReader::ReadBlock(size_t blockNumber, string& block) const {
 
 GetResult SSTableReader::Get(string_view key, uint64_t snapshotSeq) const {
     if (fd_ < 0) return {GetState::Error, {}, 0, Status::Closed()};
+    if (!bloomFilter_.empty() && !BloomFilter::MayContain(key, bloomFilter_)) return {};
     const auto lookup = EncodeInternalKey(key, snapshotSeq, ValueType::Value);
     const auto entry = lower_bound(index_.begin(), index_.end(), lookup,
         [](const BlockIndex& block, string_view target) {
