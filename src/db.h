@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace quorum {
 
@@ -36,7 +37,9 @@ private:
     Status FlushMemTable();
     Status BuildTable(MemTable* mem, uint64_t number, FileMetadata& metadata);
     Status FlushRecoveredMemTable();
-    Status CompactLevel();
+    Status CompactOnce();
+    Status InstallCompaction(const CompactionPlan& plan, const std::vector<FileMetadata>& outputs,
+                             bool& manifestAttempted);
     Status Recover();
     Status DeleteObsoleteWALs(uint64_t oldest);
     void ReleaseResources();

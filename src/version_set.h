@@ -14,7 +14,14 @@ struct TableFile {
     FileMetadata metadata;
     std::string path;
     std::atomic<bool> obsolete{false};
+    std::shared_ptr<TableFile> fileOwner;
     ~TableFile();
+};
+
+struct CompactionPlan {
+    int sourceLevel = -1;
+    int destinationLevel = -1;
+    std::vector<std::shared_ptr<TableFile>> inputs;
 };
 
 struct Version {
@@ -33,6 +40,7 @@ public:
     GetResult Get(std::string_view key, uint64_t snapshotSeq,
                   const std::shared_ptr<const Version>& version) const;
     int CompactionLevel() const;
+    CompactionPlan PickCompaction() const;
     bool NeedsCompaction() const { return CompactionLevel() >= 0; }
     void Clear() { current_.reset(); }
 

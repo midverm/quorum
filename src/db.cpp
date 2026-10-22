@@ -368,7 +368,7 @@ void DB::FlushWorker() {
         lock.unlock();
         Status status;
         try {
-            status = flush ? FlushMemTable() : CompactLevel();
+            status = flush ? FlushMemTable() : CompactOnce();
         } catch (const exception& exception) {
             status = Status::IOError(exception.what());
         }
@@ -393,107 +393,119 @@ Status DB::DeleteObsoleteWALs(uint64_t oldest) {
     return removed ? SyncDirectory(path_) : Status{};
 }
 
-Status DB::CompactLevel() {
-    shared_ptr<const Version> version;
-    vector<shared_ptr<TableFile>> inputs;
-    int level;
-    {
-        lock_guard<mutex> lock(dbMutex_);
-        level = versions_.CompactionLevel();
-        if (level < 0) return {};
-        version = versions_.Current();
-    }
-    string smallest, largest;
-    for (const auto& file : version->files) {
-        if (file->metadata.level != static_cast<uint32_t>(level)) continue;
-        inputs.push_back(file);
-        const auto low = UserKey(file->metadata.smallest);
-        const auto high = UserKey(file->metadata.largest);
-        if (inputs.size() == 1 || low < smallest) smallest.assign(low);
-        if (inputs.size() == 1 || high > largest) largest.assign(high);
-        if (level != 0) break;
-    }
-    for (const auto& file : version->files) {
-        if (file->metadata.level == static_cast<uint32_t>(level + 1) &&
-            UserKey(file->metadata.smallest) <= largest && UserKey(file->metadata.largest) >= smallest)
-            inputs.push_back(file);
-    }
-    vector<unique_ptr<SSTableReader>> readers;
-    vector<unique_ptr<SSTableReader::Iterator>> iterators;
-    for (const auto& input : inputs) {
-        auto reader = make_unique<SSTableReader>();
-        Status status = reader->Open(input->path);
-        if (!status.ok()) return status;
-        auto iterator = reader->NewIterator();
-        iterator->SeekToFirst();
-        if (!iterator->status().ok()) return iterator->status();
-        readers.push_back(std::move(reader));
-        iterators.push_back(std::move(iterator));
-    }
-    const auto later = [&](size_t a, size_t b) {
-        return CompareInternalKeys(iterators[a]->key(), iterators[b]->key()) > 0;
-    };
-    priority_queue<size_t, vector<size_t>, decltype(later)> heap(later);
-    for (size_t i = 0; i < iterators.size(); ++i)
-        if (iterators[i]->Valid()) heap.push(i);
+Status DB::InstallCompaction(const CompactionPlan& plan, const vector<FileMetadata>& outputs,
+                             bool& manifestAttempted) {
+    manifestAttempted = false;
     VersionEdit edit;
-    for (const auto& input : inputs)
+    for (const auto& input : plan.inputs)
         edit.removed.emplace_back(input->metadata.level, input->metadata.number);
-    unique_ptr<SSTableBuilder> builder;
-    string lastKey;
-    while (!heap.empty()) {
-        const size_t index = heap.top();
-        heap.pop();
-        auto& iterator = iterators[index];
-        if (lastKey.empty() || CompareInternalKeys(lastKey, iterator->key()) != 0) {
-            if (builder && builder->FileSize() >= 2 * 1024 * 1024 &&
-                UserKey(lastKey) != UserKey(iterator->key())) {
-                FileMetadata metadata;
-                Status status = builder->Finish(metadata);
-                if (!status.ok()) return status;
-                edit.added.push_back(std::move(metadata));
-                builder.reset();
-            }
-            if (!builder) {
-                uint64_t number;
-                {
-                    lock_guard<mutex> lock(dbMutex_);
-                    number = versions_.NewFileNumber();
-                }
-                if (number == 0) return Status::IOError("file numbers exhausted");
-                builder = make_unique<SSTableBuilder>(
-                    path_ + "/" + FileName(number, ".sst"), number, level + 1);
-            }
-            Status status = builder->Add(iterator->key(), iterator->value());
-            if (!status.ok()) return status;
-            lastKey.assign(iterator->key());
-        }
-        iterator->Next();
-        if (!iterator->status().ok()) return iterator->status();
-        if (iterator->Valid()) heap.push(index);
-    }
-    if (builder) {
-        FileMetadata metadata;
-        Status status = builder->Finish(metadata);
-        if (!status.ok()) return status;
-        edit.added.push_back(std::move(metadata));
-    }
+    edit.added = outputs;
+    lock_guard<mutex> lock(dbMutex_);
+    if (!backgroundError_.ok()) return backgroundError_;
+    edit.lastSequence = lastSequence_;
+    edit.oldestRequiredWal = oldestRequiredWal_;
+    edit.nextFileNumber = versions_.NextFileNumber();
     shared_ptr<Version> next;
-    Status status;
-    {
-        lock_guard<mutex> lock(dbMutex_);
-        edit.lastSequence = lastSequence_;
-        edit.oldestRequiredWal = oldestRequiredWal_;
-        edit.nextFileNumber = versions_.NextFileNumber();
-        status = versions_.BuildNext(edit, next);
-    }
-    if (status.ok()) status = manifest_.AppendAndSync(edit);
+    Status status = versions_.BuildNext(edit, next);
     if (!status.ok()) return status;
+    manifestAttempted = true;
+    status = manifest_.AppendAndSync(edit);
+    if (status.ok()) versions_.Publish(std::move(next));
+    return status;
+}
+
+Status DB::CompactOnce() {
+    CompactionPlan plan;
     {
         lock_guard<mutex> lock(dbMutex_);
-        versions_.Publish(std::move(next));
+        if (shuttingDown_) return {};
+        if (!backgroundError_.ok()) return backgroundError_;
+        plan = versions_.PickCompaction();
     }
-    return {};
+    if (plan.inputs.empty()) return {};
+    bool manifestAttempted = false;
+    vector<FileMetadata> outputs;
+    vector<string> outputPaths;
+    unique_ptr<SSTableBuilder> builder;
+    string outputPath;
+    auto fail = [&](Status status) {
+        builder.reset();
+        for (const auto& path : outputPaths) ::unlink(path.c_str());
+        return status;
+    };
+    try {
+        if (plan.inputs.size() == 1) {
+            FileMetadata metadata = plan.inputs.front()->metadata;
+            metadata.level = static_cast<uint32_t>(plan.destinationLevel);
+            outputs.push_back(std::move(metadata));
+            return InstallCompaction(plan, outputs, manifestAttempted);
+        }
+        vector<unique_ptr<SSTableReader>> readers;
+        vector<unique_ptr<SSTableReader::Iterator>> iterators;
+        for (const auto& input : plan.inputs) {
+            auto reader = make_unique<SSTableReader>();
+            Status status = reader->Open(input->path);
+            if (!status.ok()) return fail(status);
+            auto iterator = reader->NewIterator();
+            iterator->SeekToFirst();
+            if (!iterator->status().ok()) return fail(iterator->status());
+            readers.push_back(std::move(reader));
+            iterators.push_back(std::move(iterator));
+        }
+        const auto later = [&](size_t a, size_t b) {
+            return CompareInternalKeys(iterators[a]->key(), iterators[b]->key()) > 0;
+        };
+        priority_queue<size_t, vector<size_t>, decltype(later)> heap(later);
+        for (size_t i = 0; i < iterators.size(); ++i)
+            if (iterators[i]->Valid()) heap.push(i);
+        string lastKey;
+        while (!heap.empty()) {
+            const size_t index = heap.top();
+            heap.pop();
+            auto& iterator = iterators[index];
+            if (lastKey.empty() || CompareInternalKeys(lastKey, iterator->key()) != 0) {
+                if (builder && builder->FileSize() >= 2 * 1024 * 1024 &&
+                    UserKey(lastKey) != UserKey(iterator->key())) {
+                    outputPaths.push_back(outputPath);
+                    FileMetadata metadata;
+                    Status status = builder->Finish(metadata);
+                    if (!status.ok()) return fail(status);
+                    outputs.push_back(std::move(metadata));
+                    builder.reset();
+                }
+                if (!builder) {
+                    uint64_t number;
+                    {
+                        lock_guard<mutex> lock(dbMutex_);
+                        number = versions_.NewFileNumber();
+                    }
+                    if (number == 0) return fail(Status::IOError("file numbers exhausted"));
+                    outputPath = path_ + "/" + FileName(number, ".sst");
+                    builder = make_unique<SSTableBuilder>(
+                        outputPath, number, static_cast<uint32_t>(plan.destinationLevel));
+                }
+                Status status = builder->Add(iterator->key(), iterator->value());
+                if (!status.ok()) return fail(status);
+                lastKey.assign(iterator->key());
+            }
+            iterator->Next();
+            if (!iterator->status().ok()) return fail(iterator->status());
+            if (iterator->Valid()) heap.push(index);
+        }
+        if (builder) {
+            outputPaths.push_back(outputPath);
+            FileMetadata metadata;
+            Status status = builder->Finish(metadata);
+            if (!status.ok()) return fail(status);
+            outputs.push_back(std::move(metadata));
+        }
+        Status status = InstallCompaction(plan, outputs, manifestAttempted);
+        if (!status.ok() && !manifestAttempted) return fail(status);
+        return status;
+    } catch (...) {
+        if (!manifestAttempted) fail(Status{});
+        throw;
+    }
 }
 
 Status DB::Close() {

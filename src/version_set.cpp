@@ -13,7 +13,7 @@ namespace quorum {
 using namespace std;
 
 TableFile::~TableFile() {
-    if (obsolete.load(memory_order_relaxed)) ::unlink(path.c_str());
+    if (!fileOwner && obsolete.load(memory_order_relaxed)) ::unlink(path.c_str());
 }
 
 uint64_t VersionSet::NewFileNumber() {
@@ -35,8 +35,10 @@ Status VersionSet::BuildNext(const VersionEdit& edit, shared_ptr<Version>& next)
     }
     unordered_set<uint64_t> numbers;
     for (const auto& file : current_->files) {
-        numbers.insert(file->metadata.number);
-        if (removed.count(file->metadata.number) == 0) result->files.push_back(file);
+        if (removed.count(file->metadata.number) == 0) {
+            numbers.insert(file->metadata.number);
+            result->files.push_back(file);
+        }
     }
     for (const auto& metadata : edit.added) {
         if (metadata.number == 0 || metadata.number >= edit.nextFileNumber || metadata.level > 31 ||
@@ -49,6 +51,16 @@ Status VersionSet::BuildNext(const VersionEdit& edit, shared_ptr<Version>& next)
         auto file = make_shared<TableFile>();
         file->metadata = metadata;
         file->path = path_ + "/" + FileName(metadata.number, ".sst");
+        const auto existing = find_if(current_->files.begin(), current_->files.end(),
+            [&](const auto& input) { return input->metadata.number == metadata.number; });
+        if (existing != current_->files.end()) {
+            const auto& old = (*existing)->metadata;
+            if (!removed.count(metadata.number) || metadata.level != old.level + 1 ||
+                metadata.fileSize != old.fileSize || metadata.smallest != old.smallest ||
+                metadata.largest != old.largest)
+                return Status::Corruption("invalid SSTable move");
+            file->fileOwner = (*existing)->fileOwner ? (*existing)->fileOwner : *existing;
+        }
         result->files.push_back(std::move(file));
     }
     sort(result->files.begin(), result->files.end(), [](const auto& a, const auto& b) {
@@ -67,10 +79,16 @@ Status VersionSet::BuildNext(const VersionEdit& edit, shared_ptr<Version>& next)
 }
 
 void VersionSet::Publish(shared_ptr<Version> next) {
-    for (const auto& file : current_->files)
-        if (find(next->files.begin(), next->files.end(), file) == next->files.end())
-            file->obsolete.store(true, memory_order_relaxed);
+    auto previous = std::move(current_);
     current_ = std::move(next);
+    for (const auto& file : previous->files) {
+        const bool retained = any_of(current_->files.begin(), current_->files.end(),
+            [&](const auto& candidate) { return candidate->metadata.number == file->metadata.number; });
+        if (!retained) {
+            const auto& owner = file->fileOwner ? file->fileOwner : file;
+            owner->obsolete.store(true, memory_order_relaxed);
+        }
+    }
 }
 
 GetResult VersionSet::Get(string_view key, uint64_t snapshotSeq,
@@ -101,14 +119,42 @@ int VersionSet::CompactionLevel() const {
             sizes[level] = numeric_limits<uint64_t>::max();
         else sizes[level] += file->metadata.fileSize;
     }
-    if (levelZero >= 4) return 0;
+    double bestScore = static_cast<double>(levelZero) / 4;
+    int selected = bestScore >= 1 ? 0 : -1;
     uint64_t limit = 10 * 1024 * 1024;
     for (int level = 1; level < 31; ++level) {
-        if (sizes[level] >= limit) return level;
+        const double score = static_cast<double>(sizes[level]) / limit;
+        if (score >= 1 && (selected < 0 || score > bestScore)) {
+            bestScore = score;
+            selected = level;
+        }
         if (limit <= numeric_limits<uint64_t>::max() / 10) limit *= 10;
         else limit = numeric_limits<uint64_t>::max();
     }
-    return -1;
+    return selected;
+}
+
+CompactionPlan VersionSet::PickCompaction() const {
+    CompactionPlan plan;
+    plan.sourceLevel = CompactionLevel();
+    if (plan.sourceLevel < 0) return plan;
+    plan.destinationLevel = plan.sourceLevel + 1;
+    string smallest, largest;
+    for (const auto& file : current_->files) {
+        if (file->metadata.level != static_cast<uint32_t>(plan.sourceLevel)) continue;
+        plan.inputs.push_back(file);
+        const auto low = UserKey(file->metadata.smallest);
+        const auto high = UserKey(file->metadata.largest);
+        if (plan.inputs.size() == 1 || low < smallest) smallest.assign(low);
+        if (plan.inputs.size() == 1 || high > largest) largest.assign(high);
+        if (plan.sourceLevel != 0) break;
+    }
+    for (const auto& file : current_->files) {
+        if (file->metadata.level == static_cast<uint32_t>(plan.destinationLevel) &&
+            UserKey(file->metadata.smallest) <= largest && UserKey(file->metadata.largest) >= smallest)
+            plan.inputs.push_back(file);
+    }
+    return plan;
 }
 
 }
