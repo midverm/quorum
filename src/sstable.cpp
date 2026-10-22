@@ -54,7 +54,7 @@ Status SSTableBuilder::Add(string_view internalKey, string_view value) {
         (Type(internalKey) == ValueType::Deletion && !value.empty()) ||
         internalKey.size() > kMaxRecordSize - 8 ||
         value.size() > kMaxRecordSize - 8 - internalKey.size() ||
-        (!lastKey_.empty() && CompareInternalKeys(lastKey_, internalKey) >= 0))
+        (!lastKey_.empty() && CompareInternalKeys(lastKey_, internalKey) > 0))
         return status_ = Status::InvalidArgument("invalid or unordered SSTable entry");
     uint32_t sharedLen = 0;
     bool restart = entriesInBlock_ % kRestartInterval == 0;
@@ -203,7 +203,7 @@ Status SSTableReader::Open(const string& path) {
                 !Take64(view, block.size) || block.offset != nextOffset ||
                 block.size < 8 || block.size > kMaxRecordSize + 8ULL ||
                 block.offset > indexOffset || block.size > indexOffset - block.offset ||
-                (!blocks.empty() && CompareInternalKeys(blocks.back().lastKey, block.lastKey) >= 0)) {
+                (!blocks.empty() && CompareInternalKeys(blocks.back().lastKey, block.lastKey) > 0)) {
                 status = Status::Corruption("invalid SSTable block index");
                 break;
             }
@@ -309,8 +309,8 @@ void SSTableReader::Iterator::LoadBlock() {
         string key;
         string_view value;
         if (!TakeEntry(entry, key, value) ||
-            (!previous.empty() && CompareInternalKeys(previous, key) >= 0) ||
-            (blockNumber_ > 0 && CompareInternalKeys(reader_->index_[blockNumber_ - 1].lastKey, key) >= 0) ||
+            (!previous.empty() && CompareInternalKeys(previous, key) > 0) ||
+            (blockNumber_ > 0 && CompareInternalKeys(reader_->index_[blockNumber_ - 1].lastKey, key) > 0) ||
             CompareInternalKeys(key, reader_->index_[blockNumber_].lastKey) > 0) {
             status_ = Status::Corruption("invalid SSTable restart entry");
             return;
@@ -336,9 +336,9 @@ void SSTableReader::Iterator::ReadEntry() {
     if (atRestart) ++restart;
     key_ = previousKey_;
     if (!TakeEntry(remaining_, key_, value_) ||
-        (!previousKey_.empty() && CompareInternalKeys(previousKey_, key_) >= 0) ||
+        (!previousKey_.empty() && CompareInternalKeys(previousKey_, key_) > 0) ||
         (previousKey_.empty() && blockNumber_ > 0 &&
-         CompareInternalKeys(reader_->index_[blockNumber_ - 1].lastKey, key_) >= 0) ||
+         CompareInternalKeys(reader_->index_[blockNumber_ - 1].lastKey, key_) > 0) ||
         CompareInternalKeys(key_, reader_->index_[blockNumber_].lastKey) > 0 ||
         (restart != restarts_.end() && *restart < entriesEnd_ - remaining_.size()) ||
         (remaining_.empty() && key_ != reader_->index_[blockNumber_].lastKey)) {
@@ -381,7 +381,7 @@ void SSTableReader::Iterator::Seek(string_view target) {
             status_ = Status::Corruption("invalid SSTable restart entry");
             return;
         }
-        if (CompareInternalKeys(key, lookup) <= 0) low = middle + 1;
+        if (CompareInternalKeys(key, lookup) < 0) low = middle + 1;
         else high = middle;
     }
     const size_t offset = restarts_[low == 0 ? 0 : low - 1];

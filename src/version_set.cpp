@@ -102,8 +102,8 @@ GetResult VersionSet::Get(string_view key, uint64_t snapshotSeq,
         if (!status.ok()) return {GetState::Error, {}, 0, status};
         auto candidate = reader.Get(key, snapshotSeq);
         if (candidate.state == GetState::Error) return candidate;
-        if (candidate.state != GetState::Absent &&
-            (result.state == GetState::Absent || candidate.sequence > result.sequence))
+        if (candidate.state != GetState::NotFound &&
+            (result.state == GetState::NotFound || candidate.sequence > result.sequence))
             result = std::move(candidate);
     }
     return result;

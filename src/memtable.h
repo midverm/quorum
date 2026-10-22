@@ -12,10 +12,10 @@
 namespace quorum {
 
 enum class ValueType : uint8_t { Deletion = 0, Value = 1 };
-enum class GetState { Found, Absent, Deleted, Error };
+enum class GetState { Found, NotFound, Deleted, Error };
 
 struct GetResult {
-    GetState state = GetState::Absent;
+    GetState state = GetState::NotFound;
     std::string value;
     uint64_t sequence = 0;
     Status status;

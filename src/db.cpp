@@ -255,8 +255,8 @@ Status DB::Get(string_view key, string& value) {
     GetResult result;
     try {
         result = mem->Get(key, snapshotSeq);
-        if (result.state == GetState::Absent && imm) result = imm->Get(key, snapshotSeq);
-        if (result.state == GetState::Absent) result = versions_.Get(key, snapshotSeq, version);
+        if (result.state == GetState::NotFound && imm) result = imm->Get(key, snapshotSeq);
+        if (result.state == GetState::NotFound) result = versions_.Get(key, snapshotSeq, version);
         if (result.state == GetState::Found) value = std::move(result.value);
         else value.clear();
     } catch (const exception& exception) {
@@ -463,31 +463,29 @@ Status DB::CompactOnce() {
             const size_t index = heap.top();
             heap.pop();
             auto& iterator = iterators[index];
-            if (lastKey.empty() || CompareInternalKeys(lastKey, iterator->key()) != 0) {
-                if (builder && builder->FileSize() >= 2 * 1024 * 1024 &&
-                    UserKey(lastKey) != UserKey(iterator->key())) {
-                    outputPaths.push_back(outputPath);
-                    FileMetadata metadata;
-                    Status status = builder->Finish(metadata);
-                    if (!status.ok()) return fail(status);
-                    outputs.push_back(std::move(metadata));
-                    builder.reset();
-                }
-                if (!builder) {
-                    uint64_t number;
-                    {
-                        lock_guard<mutex> lock(dbMutex_);
-                        number = versions_.NewFileNumber();
-                    }
-                    if (number == 0) return fail(Status::IOError("file numbers exhausted"));
-                    outputPath = path_ + "/" + FileName(number, ".sst");
-                    builder = make_unique<SSTableBuilder>(
-                        outputPath, number, static_cast<uint32_t>(plan.destinationLevel));
-                }
-                Status status = builder->Add(iterator->key(), iterator->value());
+            if (builder && builder->FileSize() >= 2 * 1024 * 1024 &&
+                UserKey(lastKey) != UserKey(iterator->key())) {
+                outputPaths.push_back(outputPath);
+                FileMetadata metadata;
+                Status status = builder->Finish(metadata);
                 if (!status.ok()) return fail(status);
-                lastKey.assign(iterator->key());
+                outputs.push_back(std::move(metadata));
+                builder.reset();
             }
+            if (!builder) {
+                uint64_t number;
+                {
+                    lock_guard<mutex> lock(dbMutex_);
+                    number = versions_.NewFileNumber();
+                }
+                if (number == 0) return fail(Status::IOError("file numbers exhausted"));
+                outputPath = path_ + "/" + FileName(number, ".sst");
+                builder = make_unique<SSTableBuilder>(
+                    outputPath, number, static_cast<uint32_t>(plan.destinationLevel));
+            }
+            Status status = builder->Add(iterator->key(), iterator->value());
+            if (!status.ok()) return fail(status);
+            lastKey.assign(iterator->key());
             iterator->Next();
             if (!iterator->status().ok()) return fail(iterator->status());
             if (iterator->Valid()) heap.push(index);
