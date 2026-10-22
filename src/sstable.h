@@ -47,6 +47,9 @@ private:
     uint64_t offset_ = 0;
     std::string block_;
     std::string lastKey_;
+    std::string previousKey_;
+    std::vector<uint32_t> restarts_;
+    uint32_t entriesInBlock_ = 0;
     std::vector<BlockIndex> index_;
     BloomFilter bloom_;
 };
@@ -57,6 +60,7 @@ public:
     public:
         explicit Iterator(const SSTableReader* reader) : reader_(reader) {}
         void SeekToFirst();
+        void Seek(std::string_view target);
         void Next();
         bool Valid() const { return valid_; }
         std::string_view key() const { return key_; }
@@ -70,8 +74,12 @@ public:
         std::size_t blockNumber_ = 0;
         std::string block_;
         std::string_view remaining_;
-        std::string_view key_;
+        std::string key_;
         std::string_view value_;
+        std::string previousKey_;
+        std::vector<uint32_t> restarts_;
+        std::size_t entriesEnd_ = 0;
+        uint32_t entriesSinceRestart_ = 0;
         bool valid_ = false;
         Status status_;
     };
