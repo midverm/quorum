@@ -18,7 +18,9 @@ namespace quorum {
 
 class DB {
 public:
-    explicit DB(std::string path) : path_(std::move(path)), versions_(path_) {}
+    explicit DB(std::string path)
+        : path_(std::move(path)), blockCache_(std::make_shared<BlockCache>()),
+          tableCache_(std::make_shared<TableCache>(blockCache_)), versions_(path_, tableCache_) {}
     ~DB();
     DB(const DB&) = delete;
     DB& operator=(const DB&) = delete;
@@ -66,6 +68,8 @@ private:
     int lockFd_ = -1;
     Status backgroundError_;
     Status closeStatus_;
+    std::shared_ptr<BlockCache> blockCache_;
+    std::shared_ptr<TableCache> tableCache_;
     VersionSet versions_;
     Manifest manifest_;
 };

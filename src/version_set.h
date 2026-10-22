@@ -2,6 +2,7 @@
 
 #include "manifest.h"
 #include "memtable.h"
+#include "table_cache.h"
 
 #include <atomic>
 #include <memory>
@@ -30,7 +31,10 @@ struct Version {
 
 class VersionSet {
 public:
-    explicit VersionSet(std::string path) : path_(std::move(path)), current_(std::make_shared<Version>()) {}
+    explicit VersionSet(std::string path,
+                        std::shared_ptr<TableCache> tableCache = std::make_shared<TableCache>())
+        : path_(std::move(path)), current_(std::make_shared<Version>()),
+          tableCache_(std::move(tableCache)) {}
     std::shared_ptr<const Version> Current() const { return current_; }
     uint64_t NewFileNumber();
     uint64_t NextFileNumber() const { return nextFileNumber_; }
@@ -42,11 +46,12 @@ public:
     int CompactionLevel() const;
     CompactionPlan PickCompaction() const;
     bool NeedsCompaction() const { return CompactionLevel() >= 0; }
-    void Clear() { current_.reset(); }
+    void Clear() { current_.reset(); tableCache_.reset(); }
 
 private:
     std::string path_;
     std::shared_ptr<Version> current_;
+    std::shared_ptr<TableCache> tableCache_;
     uint64_t nextFileNumber_ = 1;
 };
 

@@ -97,10 +97,10 @@ GetResult VersionSet::Get(string_view key, uint64_t snapshotSeq,
     for (const auto& file : version->files) {
         const auto& metadata = file->metadata;
         if (key < UserKey(metadata.smallest) || key > UserKey(metadata.largest)) continue;
-        SSTableReader reader;
-        Status status = reader.Open(file->path);
+        shared_ptr<SSTableReader> reader;
+        Status status = tableCache_->Get(file, reader);
         if (!status.ok()) return {GetState::Error, {}, 0, status};
-        auto candidate = reader.Get(key, snapshotSeq);
+        auto candidate = reader->Get(key, snapshotSeq);
         if (candidate.state == GetState::Error) return candidate;
         if (candidate.state != GetState::NotFound &&
             (result.state == GetState::NotFound || candidate.sequence > result.sequence))

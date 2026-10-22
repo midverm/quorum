@@ -26,7 +26,9 @@ Status DB::Open() {
     if (path_.empty()) return Status::InvalidArgument("database path is empty");
     backgroundError_ = {};
     closeStatus_ = {};
-    versions_ = VersionSet(path_);
+    blockCache_ = make_shared<BlockCache>();
+    tableCache_ = make_shared<TableCache>(blockCache_);
+    versions_ = VersionSet(path_, tableCache_);
     error_code error;
     const bool created = filesystem::create_directories(path_, error);
     if (error) return Status::IOError("create database directory: " + error.message());
@@ -400,7 +402,7 @@ Status DB::InstallCompaction(const CompactionPlan& plan, const vector<FileMetada
     for (const auto& input : plan.inputs)
         edit.removed.emplace_back(input->metadata.level, input->metadata.number);
     edit.added = outputs;
-    lock_guard<mutex> lock(dbMutex_);
+    unique_lock<mutex> lock(dbMutex_);
     if (!backgroundError_.ok()) return backgroundError_;
     edit.lastSequence = lastSequence_;
     edit.oldestRequiredWal = oldestRequiredWal_;
@@ -411,6 +413,18 @@ Status DB::InstallCompaction(const CompactionPlan& plan, const vector<FileMetada
     manifestAttempted = true;
     status = manifest_.AppendAndSync(edit);
     if (status.ok()) versions_.Publish(std::move(next));
+    lock.unlock();
+    if (status.ok()) {
+        for (const auto& input : plan.inputs) {
+            const uint64_t number = input->metadata.number;
+            const bool retained = any_of(outputs.begin(), outputs.end(),
+                [&](const auto& output) { return output.number == number; });
+            if (!retained) {
+                tableCache_->Evict(number);
+                blockCache_->EvictFile(number);
+            }
+        }
+    }
     return status;
 }
 
@@ -440,16 +454,14 @@ Status DB::CompactOnce() {
             outputs.push_back(std::move(metadata));
             return InstallCompaction(plan, outputs, manifestAttempted);
         }
-        vector<unique_ptr<SSTableReader>> readers;
         vector<unique_ptr<SSTableReader::Iterator>> iterators;
         for (const auto& input : plan.inputs) {
-            auto reader = make_unique<SSTableReader>();
-            Status status = reader->Open(input->path);
+            shared_ptr<SSTableReader> reader;
+            Status status = tableCache_->Get(input, reader);
             if (!status.ok()) return fail(status);
             auto iterator = reader->NewIterator();
             iterator->SeekToFirst();
             if (!iterator->status().ok()) return fail(iterator->status());
-            readers.push_back(std::move(reader));
             iterators.push_back(std::move(iterator));
         }
         const auto later = [&](size_t a, size_t b) {
@@ -543,6 +555,8 @@ void DB::ReleaseResources() {
     mem_ = nullptr;
     imm_ = nullptr;
     versions_.Clear();
+    tableCache_.reset();
+    blockCache_.reset();
     manifest_.Close();
     if (lockFd_ >= 0) {
         ::flock(lockFd_, LOCK_UN);

@@ -1,5 +1,7 @@
 #include "sstable.h"
 
+#include "block_cache.h"
+#include "version_set.h"
 #include "wal.h"
 
 #include <algorithm>
@@ -269,30 +271,43 @@ void SSTableReader::Iterator::SeekToFirst() {
 
 void SSTableReader::Iterator::LoadBlock() {
     valid_ = false;
+    remaining_ = {};
+    value_ = {};
+    block_.reset();
     if (blockNumber_ >= reader_->index_.size()) return;
-    status_ = reader_->ReadBlock(blockNumber_, block_);
-    if (!status_.ok()) return;
+    const auto& index = reader_->index_[blockNumber_];
+    const auto& cache = reader_->blockCache_;
+    const auto& file = reader_->file_;
+    const BlockKey cacheKey{file ? file->metadata.number : 0, index.offset};
+    if (cache && file) block_ = cache->Get(cacheKey);
+    const bool cached = block_ != nullptr;
+    if (!cached) {
+        auto bytes = make_shared<string>();
+        status_ = reader_->ReadBlock(blockNumber_, *bytes);
+        if (!status_.ok()) return;
+        block_ = std::move(bytes);
+    }
     previousKey_.clear();
     restarts_.clear();
     entriesSinceRestart_ = 0;
-    entriesEnd_ = block_.size();
+    entriesEnd_ = block_->size();
     uint32_t count;
-    string_view tail(block_);
+    string_view tail(*block_);
     if (tail.size() < 8) {
         status_ = Status::Corruption("short SSTable restart metadata");
         return;
     }
     tail.remove_prefix(tail.size() - 4);
-    if (!Take32(tail, count) || count == 0 || count > (block_.size() - 4) / 4) {
+    if (!Take32(tail, count) || count == 0 || count > (block_->size() - 4) / 4) {
         status_ = Status::Corruption("invalid SSTable restart count");
         return;
     }
-    entriesEnd_ = block_.size() - 4 - static_cast<size_t>(count) * 4;
+    entriesEnd_ = block_->size() - 4 - static_cast<size_t>(count) * 4;
     if (count > entriesEnd_ / 21) {
         status_ = Status::Corruption("invalid SSTable restart count");
         return;
     }
-    tail = string_view(block_).substr(entriesEnd_, static_cast<size_t>(count) * 4);
+    tail = string_view(*block_).substr(entriesEnd_, static_cast<size_t>(count) * 4);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t offset;
         if (!Take32(tail, offset) || offset >= entriesEnd_ || (i == 0 && offset != 0) ||
@@ -305,7 +320,7 @@ void SSTableReader::Iterator::LoadBlock() {
     string previous;
     for (size_t i = 0; i < restarts_.size(); ++i) {
         const size_t end = i + 1 < restarts_.size() ? restarts_[i + 1] : entriesEnd_;
-        string_view entry = string_view(block_).substr(restarts_[i], end - restarts_[i]);
+        string_view entry = string_view(*block_).substr(restarts_[i], end - restarts_[i]);
         string key;
         string_view value;
         if (!TakeEntry(entry, key, value) ||
@@ -317,8 +332,20 @@ void SSTableReader::Iterator::LoadBlock() {
         }
         previous = std::move(key);
     }
-    remaining_ = string_view(block_).substr(0, entriesEnd_);
+    remaining_ = string_view(*block_).substr(0, entriesEnd_);
     ReadEntry();
+    if (!cached && cache && file) {
+        // Validate every entry before publishing immutable bytes to other readers.
+        while (Valid() && !remaining_.empty()) ReadEntry();
+        if (!status_.ok()) return;
+        if (!file->obsolete.load(memory_order_relaxed)) cache->Insert(cacheKey, block_);
+        // Publication can race the insert; obsolete files must not repopulate the cache.
+        if (file->obsolete.load(memory_order_relaxed)) cache->EvictFile(cacheKey.fileNumber);
+        previousKey_.clear();
+        entriesSinceRestart_ = 0;
+        remaining_ = string_view(*block_).substr(0, entriesEnd_);
+        ReadEntry();
+    }
 }
 
 void SSTableReader::Iterator::ReadEntry() {
@@ -367,13 +394,12 @@ void SSTableReader::Iterator::Seek(string_view target) {
             return CompareInternalKeys(entry.lastKey, key) < 0;
         });
     blockNumber_ = static_cast<size_t>(block - reader_->index_.begin());
-    if (block == reader_->index_.end()) return;
     LoadBlock();
-    if (!status_.ok()) return;
+    if (!Valid()) return;
     size_t low = 0, high = restarts_.size();
     while (low < high) {
         const size_t middle = low + (high - low) / 2;
-        string_view entry = string_view(block_).substr(restarts_[middle], entriesEnd_ - restarts_[middle]);
+        string_view entry = string_view(*block_).substr(restarts_[middle], entriesEnd_ - restarts_[middle]);
         string key;
         string_view value;
         if (!TakeEntry(entry, key, value)) {
@@ -385,7 +411,7 @@ void SSTableReader::Iterator::Seek(string_view target) {
         else high = middle;
     }
     const size_t offset = restarts_[low == 0 ? 0 : low - 1];
-    remaining_ = string_view(block_).substr(offset, entriesEnd_ - offset);
+    remaining_ = string_view(*block_).substr(offset, entriesEnd_ - offset);
     previousKey_.clear();
     entriesSinceRestart_ = 0;
     ReadEntry();

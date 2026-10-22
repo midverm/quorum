@@ -12,6 +12,9 @@
 
 namespace quorum {
 
+class BlockCache;
+struct TableFile;
+
 struct FileMetadata {
     uint64_t number = 0;
     uint32_t level = 0;
@@ -54,11 +57,12 @@ private:
     BloomFilter bloom_;
 };
 
-class SSTableReader {
+class SSTableReader : public std::enable_shared_from_this<SSTableReader> {
 public:
     class Iterator {
     public:
-        explicit Iterator(const SSTableReader* reader) : reader_(reader) {}
+        explicit Iterator(const SSTableReader* reader)
+            : readerOwner_(reader->weak_from_this().lock()), reader_(reader) {}
         void SeekToFirst();
         void Seek(std::string_view target);
         void Next();
@@ -70,9 +74,10 @@ public:
     private:
         void LoadBlock();
         void ReadEntry();
+        std::shared_ptr<const SSTableReader> readerOwner_;
         const SSTableReader* reader_;
         std::size_t blockNumber_ = 0;
-        std::string block_;
+        std::shared_ptr<const std::string> block_;
         std::string_view remaining_;
         std::string key_;
         std::string_view value_;
@@ -85,6 +90,8 @@ public:
     };
 
     SSTableReader() = default;
+    SSTableReader(std::shared_ptr<BlockCache> blockCache, std::shared_ptr<TableFile> file)
+        : blockCache_(std::move(blockCache)), file_(std::move(file)) {}
     ~SSTableReader();
     SSTableReader(const SSTableReader&) = delete;
     SSTableReader& operator=(const SSTableReader&) = delete;
@@ -94,6 +101,8 @@ public:
 
 private:
     Status ReadBlock(std::size_t blockNumber, std::string& block) const;
+    std::shared_ptr<BlockCache> blockCache_;
+    std::shared_ptr<TableFile> file_;
     int fd_ = -1;
     std::vector<BlockIndex> index_;
     std::string bloomFilter_;
