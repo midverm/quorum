@@ -1,6 +1,6 @@
 # quorum
 
-embedded key-value database in c++17, built around an lsm tree.
+embedded high performance key-value database in c++17, built around an lsm tree.
 log-backed writes, leveled compaction, bloom filters and cached reads.
 runs inside your app. data lives in a folder, no separate server.
 
